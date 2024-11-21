@@ -1,7 +1,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
-#include <type_traits>
+
 
 namespace rcu {
   template<class T>
