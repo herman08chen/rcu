@@ -237,6 +237,7 @@ namespace rcu {
 
     inline void rcu_synchronize(rcu_domain& dom = rcu_default_domain()) noexcept {
         for (auto&& i : dom.garbage) {
+            i.synchronize();
             i.clear();
         }
     }
