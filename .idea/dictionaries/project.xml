@@ -1,7 +1,9 @@
 <component name="ProjectDictionaryState">
   <dictionary name="project">
     <words>
+      <w>lockfree</w>
       <w>unatomic</w>
+      <w>vnew</w>
     </words>
   </dictionary>
 </component>
