@@ -45,7 +45,7 @@ void benchmark_deque(benchmark::State& state) {
             state.threads(), benchmark::Counter::kDefaults);
         state.counters["ops/s"] = benchmark::Counter(
             state.threads() * 10'000,
-            benchmark::Counter::kIsIterationInvariantRate | benchmark::Counter::kIsRate, static_cast<benchmark::Counter::OneK>(INT_MAX));
+            benchmark::Counter::kIsIterationInvariantRate | benchmark::Counter::kIsRate);
     }
 }
 
@@ -166,5 +166,72 @@ static void BM_rcu(benchmark::State& state) {
 }
 
 BENCHMARK(BM_rcu)->Threads(1)->Threads(2)->Threads(3)->Threads(4)->Threads(5)->Threads(6);
+
+static void BM_locking_rcu(benchmark::State& state) {
+    if (state.thread_index() == 0) {
+        state.SetLabel("rcu split ref count");
+    }
+    for ([[maybe_unused]] auto _ : state) {
+        rcu::v2::rcu_default_domain().lock();
+        rcu::v2::rcu_default_domain().unlock();
+    }
+    if (state.thread_index() == 0) {
+        state.counters["threads"] = benchmark::Counter(
+            state.threads(), benchmark::Counter::kDefaults);
+    }
+}
+
+BENCHMARK(BM_locking_rcu)->Threads(1)->Threads(2)->Threads(3)->Threads(4)->Threads(5)->Threads(6);
+
+static void BM_locking_single_ref_count_rcu(benchmark::State& state) {
+    if (state.thread_index() == 0) {
+        state.SetLabel("rcu single ref count");
+    }
+    for ([[maybe_unused]] auto _ : state) {
+        rcu::single_ref_count::rcu_default_domain().lock();
+        rcu::single_ref_count::rcu_default_domain().unlock();
+    }
+    if (state.thread_index() == 0) {
+        state.counters["threads"] = benchmark::Counter(
+            state.threads(), benchmark::Counter::kDefaults);
+    }
+}
+
+BENCHMARK(BM_locking_single_ref_count_rcu)->Threads(1)->Threads(2)->Threads(3)->Threads(4)->Threads(5)->Threads(6);
+
+static void BM_locking_false_sharing_rcu(benchmark::State& state) {
+    if (state.thread_index() == 0) {
+        state.SetLabel("rcu false sharing");
+    }
+
+    for ([[maybe_unused]] auto _ : state) {
+        rcu::false_sharing::rcu_default_domain().lock();
+        rcu::false_sharing::rcu_default_domain().unlock();
+    }
+    if (state.thread_index() == 0) {
+        state.counters["threads"] = benchmark::Counter(
+            state.threads(), benchmark::Counter::kDefaults);
+    }
+}
+
+BENCHMARK(BM_locking_false_sharing_rcu)->Threads(1)->Threads(2)->Threads(3)->Threads(4)->Threads(5)->Threads(6);
+
+static void BM_locking_shared_mutex(benchmark::State& state) {
+    static std::shared_mutex mutex;
+    if (state.thread_index() == 0) {
+        state.SetLabel("shared_mutex");
+    }
+    for ([[maybe_unused]] auto _ : state) {
+        mutex.lock_shared();
+        mutex.unlock_shared();
+    }
+    if (state.thread_index() == 0) {
+        state.counters["threads"] = benchmark::Counter(
+            state.threads(), benchmark::Counter::kDefaults);
+    }
+}
+
+BENCHMARK(BM_locking_shared_mutex)->Threads(1)->Threads(2)->Threads(3)->Threads(4)->Threads(5)->Threads(6);
+
 
 BENCHMARK_MAIN();
