@@ -6,10 +6,8 @@
 #include <functional>
 #include <mutex>
 #include <ranges>
-#include <shared_mutex>
 #include <thread>
 #include <utility>
-#include <boost/lockfree/queue.hpp>
 
 namespace rcu {
 namespace v1 {
@@ -282,25 +280,28 @@ namespace v2 {
         }
         void synchronize() noexcept {
             for (auto&& i : ref_count()) {
-                while (i.load(std::memory_order_relaxed) != 0) {
+                while (i.load(std::memory_order_relaxed) != 0)
                     std::this_thread::yield();
-                }
             }
         }
         bool try_synchronize() noexcept {
             return std::ranges::all_of(ref_count(), [](auto&& count) {
-                return count.load(std::memory_order_seq_cst) == 0;
+                return count.load(std::memory_order_acquire) == 0;
             });
         }
-        bool try_push(void* ptr, deleter_t&& d) noexcept {
-            if (size < capacity) {
+        bool try_push(auto_ptr&& ptr) noexcept {
+            if (size < capacity) [[likely]] {
                 const auto index = size++;
-                queue[index] = auto_ptr{ptr, deleter_t{std::move(d)}};
+                queue[index] = std::move(ptr);
                 return true;
             }
             else {
                 return false;
             }
+        }
+        void push_unchecked(auto_ptr&& ptr) noexcept {
+            const auto index = size++;
+            queue[index] = std::move(ptr);
         }
 
         void clear() {
@@ -345,7 +346,7 @@ namespace v2 {
         }
 
         void unlock() noexcept {
-            [[maybe_unused]] auto _ = static_cast<void*>(this);
+            [[maybe_unused]] auto _ = static_cast<void*>(this); //prevents warning
             num_readers--;
             counter->fetch_sub(1, std::memory_order_release);
         }
@@ -353,10 +354,11 @@ namespace v2 {
             std::lock_guard guard{mutex};
             const auto current_gen = generation.load(std::memory_order_acquire);
             const auto next_gen = (current_gen + 1) % 2;
-            if (!garbage[current_gen % 2].try_push(p, std::move(d))) [[unlikely]] {
+            auto ptr = garbage_queue::auto_ptr{p, std::move(d)};
+            if (!garbage[current_gen % 2].try_push(std::move(ptr))) [[unlikely]] {
                 garbage[next_gen].synchronize();
                 garbage[next_gen].clear();
-                garbage[next_gen].try_push(p, std::move(d));
+                garbage[next_gen].push_unchecked(std::move(ptr));
                 generation.store(current_gen + 1, std::memory_order_release);
             }
         }
