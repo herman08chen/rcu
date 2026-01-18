@@ -305,7 +305,6 @@ namespace v2 {
         }
 
         void clear() {
-            assert(try_synchronize());
             for (auto&& [p, d] : queue | std::ranges::views::take(size)) {
                 d(p);
                 p = nullptr;
