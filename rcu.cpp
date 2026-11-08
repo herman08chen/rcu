@@ -1,14 +1,4 @@
-//
-// Created by herman on 11/22/25.
-//
-
+// Translation unit that exists solely to verify `rcu.h` compiles as a
+// standalone header. The RCU library is header-only; all definitions live in
+// the headers.
 #include "rcu.h"
-
-namespace rcu {
-    namespace v1 {
-
-    }
-    namespace v2 {
-
-    }
-}

@@ -1,679 +1,318 @@
 #ifndef RCU_RCU_H
 #define RCU_RCU_H
+
 #include <algorithm>
+#include <array>
 #include <atomic>
-#include <cassert>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <ranges>
+#include <span>
 #include <thread>
 #include <utility>
 
 namespace rcu {
-namespace v1 {
-    struct deleter_t {
-        template<class D>
-        static constexpr bool SBO = sizeof(D) <= sizeof(void*) && alignof(D) <= alignof(void*) && std::is_trivially_copyable_v<D>;
 
-        struct vtable_t {
-            std::reference_wrapper<void(std::array<char, sizeof(void*)>*, void*)> invoke_ref;
-            std::reference_wrapper<void(std::array<char, sizeof(void*)>)> dealloc_ref;
-        };
-        template<class T, class D>
-        struct vtable {
-            static void invoke(std::array<char, sizeof(void*)>* deleter, void* p) {
-                if constexpr (!std::is_same_v<D, void>) {
-                    if constexpr(SBO<D>) {
-                        std::invoke(*reinterpret_cast<D*>(deleter), static_cast<T*>(p));
-                    }
-                    else {
-                        std::invoke(**std::bit_cast<D**>(deleter), static_cast<T*>(p));
-                    }
-                }
-            }
-            static void dealloc(std::array<char, sizeof(void*)> deleter) {
-                if constexpr (!std::is_same_v<D, void>) {
-                    if constexpr(SBO<D>) {
-                        reinterpret_cast<D*>(&deleter)->~D();
-                    }
-                    else {
-                        delete std::bit_cast<D*>(deleter);
-                    }
-                }
-            }
-            static constexpr vtable_t value = {invoke, dealloc};
-        };
+// ---------------------------------------------------------------------------
+// Type-erased, move-only deleter.
+//
+// `rcu_retire` stores a callable that reclaims a retired pointer. The callable
+// is type-erased with std::move_only_function (C++23), which is move-only and
+// avoids the manual small-buffer/vtable machinery of the previous
+// implementation. Deleters are expected to be non-throwing (delete and typical
+// custom deleters are noexcept).
+// ---------------------------------------------------------------------------
 
-        template<class T, class D>
-        static constexpr vtable_t vtable_v = vtable<T, D>::value;
+namespace detail {
 
-        static constexpr vtable_t empty_vtable = vtable<void, void>::value;
+// Sharded reference counts used by an RCU domain to track active readers.
+//
+// `N`   : number of ref-count slots (readers hash to one slot).
+// `PadBytes`: padding appended to each atomic slot so that distinct slots do
+//             not share a cache line (false sharing). Set to 0 to pack slots
+//             together (deliberately demonstrates false sharing).
+template <std::size_t N, std::size_t PadBytes>
+struct padded_sharded_ref_counts {
+    static_assert(N >= 1, "at least one ref-count slot is required");
 
-        alignas(void*) std::array<char, sizeof(void*)> deleter_ptr;
-        std::reference_wrapper<const vtable_t> vtable_ref;
+    std::array<std::pair<std::atomic<std::size_t>, std::array<std::byte, PadBytes>>,
+                N>
+        slots{};
 
-        template<class T, class D>
-        constexpr explicit deleter_t(std::type_identity<T>, D d = D()) :
-            deleter_ptr{}, vtable_ref{vtable_v<T, D>} {
-            if constexpr(SBO<D>) {
-                new (static_cast<void*>(&deleter_ptr)) D{std::forward<D>(d)};
-            }
-            else {
-                deleter_ptr = std::bit_cast<decltype(deleter_ptr)>(new D{std::forward<D>(d)});
-            }
-        }
-        constexpr deleter_t() : deleter_ptr{}, vtable_ref{empty_vtable} {}
-        constexpr deleter_t(const deleter_t&) = delete;
-        constexpr deleter_t(deleter_t&& rhs) noexcept :
-            deleter_ptr{std::exchange(rhs.deleter_ptr, std::bit_cast<decltype(deleter_ptr)>(static_cast<void*>(nullptr)))},
-            vtable_ref{rhs.vtable_ref} {}
-        constexpr deleter_t& operator=(const deleter_t&) = delete;
-        constexpr deleter_t& operator=(deleter_t&& rhs) noexcept {
-            std::swap(deleter_ptr, rhs.deleter_ptr);
-            std::swap(vtable_ref, rhs.vtable_ref);
-            return *this;
-        };
-        constexpr ~deleter_t() noexcept {
-            std::invoke(vtable_ref.get().dealloc_ref, deleter_ptr);
-        }
-        constexpr void operator()(void* p) {
-            std::invoke(vtable_ref.get().invoke_ref, &deleter_ptr, p);
-        }
-        constexpr void clear() noexcept {
-            std::invoke(vtable_ref.get().dealloc_ref, deleter_ptr);
-            deleter_ptr = std::bit_cast<decltype(deleter_ptr)>(static_cast<void*>(nullptr));
-            vtable_ref = empty_vtable;
-        }
-        [[nodiscard]] constexpr bool is_empty() const noexcept {
-            return &vtable_ref.get() == &empty_vtable;
-        }
-    };
+    [[nodiscard]] static constexpr std::size_t count() noexcept { return N; }
 
-    class rcu_domain;
-    rcu_domain& rcu_default_domain() noexcept;
-
-    class rcu_domain {
-        static constexpr std::size_t num_ref_counts = 4;
-        //static constexpr std::size_t gen_size = 16 * num_ref_counts;
-        static constexpr std::size_t max_gens = 2;
-
-        inline thread_local static const std::size_t key = std::hash<std::thread::id>{}(std::this_thread::get_id()) % num_ref_counts;;
-        inline thread_local static std::uint64_t num_readers = 0;
-        inline thread_local static std::atomic<std::size_t>* counter = nullptr;;
-
-        struct gen_t {
-            using ref_count_t = std::atomic<std::size_t>;
-            using auto_ptr = std::pair<void*, deleter_t>;
-            static constexpr std::size_t num_ptrs_per_group = 64 / sizeof(auto_ptr);
-            static constexpr std::size_t ptr_capacity = num_ptrs_per_group * num_ref_counts;
-            //using chunk = std::array<auto_ptr, ptr_capacity>;
-
-            struct node {
-                auto_ptr data;
-                node* next;
-            };
-
-            std::array<ref_count_t, num_ref_counts> ref_counts;
-            //std::forward_list<chunk> garbage_queue;
-            std::atomic<node*> garbage_queue;
-            std::atomic<std::size_t> size;
-            std::mutex alloc_lock;
-
-            auto& ref_count() noexcept {
-                return ref_counts;
-            }
-            /*auto garbage() noexcept {
-                return garbage_queue | std::ranges::views::join;
-            }*/
-
-            ~gen_t() noexcept {
-                assert(try_synchronize());
-                clear();
-            }
-            void synchronize() noexcept {
-                for (auto&& i : ref_count()) {
-                    while (i.load(std::memory_order_acquire) != 0) {
-                        std::this_thread::yield();
-                    }
-                }
-            }
-            bool try_synchronize() noexcept {
-                return std::ranges::all_of(ref_count(), [](auto&& count) {
-                    return count.load(std::memory_order_acquire) == 0;
-                });
-            }
-            void push(void* ptr, deleter_t&& d) {
-                auto* expected = garbage_queue.load(std::memory_order_acquire);
-                auto* my_node = new node(auto_ptr{ptr, std::move(d)}, expected);
-                while (!garbage_queue.compare_exchange_weak(expected, my_node)) {
-                    my_node->next = expected;
-                }
-                size.fetch_add(1, std::memory_order_release);
-            }
-            void clear() {
-                assert(try_synchronize());
-                auto* ptr = garbage_queue.load(std::memory_order_acquire);
-                while (ptr) {
-                    auto* next = ptr->next;
-                    auto&& [p, d] = ptr->data;
-                    d(p);
-                    p = nullptr;
-                    d.clear();
-                    delete ptr;
-                    ptr = next;
-                }
-                garbage_queue.store(nullptr, std::memory_order_release);
-                size.store(0, std::memory_order_release);
-            }
-            [[nodiscard]] bool is_full() const {
-                return size.load(std::memory_order_acquire) % ptr_capacity == 0;
-            }
-        };
-
-        std::atomic<std::size_t> generation;
-        std::array<gen_t, max_gens> garbage;
-        std::mutex cleanup_lock;
-
-        struct default_domain_tag_t {};
-        explicit rcu_domain(default_domain_tag_t) : generation{}, garbage{}, cleanup_lock {} {}
-
-        /*auto garbage_queue_view() noexcept {
-            return garbage | std::ranges::views::transform([](gen_t& gen) {
-                return gen.garbage();
-            });
-        }*/
-        auto ref_count_view() noexcept {
-            return garbage | std::ranges::views::transform([](gen_t& gen) -> auto& {
-                return gen.ref_count();
-            });
-        }
-
-    public:
-        rcu_domain() = delete;
-        rcu_domain(const rcu_domain&) = delete;
-        rcu_domain(rcu_domain&&) = delete;
-        rcu_domain& operator=(const rcu_domain&) = delete;
-        rcu_domain& operator=(rcu_domain&&) = delete;
-        ~rcu_domain() noexcept = default;
-
-        void lock() noexcept {
-            if (num_readers == 0)
-                counter = &garbage[generation.load(std::memory_order_acquire) % max_gens].ref_count()[key];
-            num_readers++;
-            counter->fetch_add(1, std::memory_order_release);
-        }
-        bool try_lock() noexcept {
-            lock();
-            return true;
-        }
-
-        void unlock() noexcept {
-            [[maybe_unused]] auto _ = static_cast<void*>(this);
-            num_readers--;
-            counter->fetch_sub(1, std::memory_order_release);
-        }
-
-        void retire(void* p, deleter_t&& d) {
-            auto current_gen = generation.load(std::memory_order_acquire);
-            if (garbage[current_gen % max_gens].is_full() && garbage[(current_gen + 1) % max_gens].try_synchronize() && cleanup_lock.try_lock()) {
-                current_gen++;
-                generation.store(current_gen, std::memory_order_release);
-                garbage[current_gen % max_gens].clear();
-                cleanup_lock.unlock();
-            }
-            garbage[current_gen % max_gens].push(p, std::move(d));
-        }
-        friend void rcu_synchronize(rcu_domain& dom) noexcept;
-        friend rcu_domain& rcu_default_domain() noexcept;
-    };
-    template<class T, class D = std::default_delete<T>>
-    void rcu_retire(T* p, D d = D(), rcu_domain& dom = rcu_default_domain()) {
-        dom.retire(static_cast<void*>(p), deleter_t{std::type_identity<T>{}, std::move(d)});
-    }
-    inline rcu_domain& rcu_default_domain() noexcept {
-        static rcu_domain domain{rcu_domain::default_domain_tag_t{}};
-        return domain;
+    [[nodiscard]] std::atomic<std::size_t>& at(std::size_t index) noexcept {
+        return slots[index].first;
     }
 
-    inline void rcu_synchronize(rcu_domain& dom = rcu_default_domain()) noexcept {
-        std::lock_guard guard{dom.cleanup_lock};
-        dom.generation.fetch_add(1, std::memory_order_release);
-        for (auto&& i : dom.garbage) {
-            i.synchronize();
-            i.clear();
-        }
+    [[nodiscard]] auto refs() noexcept {
+        return slots | std::ranges::views::keys;
     }
+};
 
-    inline void rcu_barrier(rcu_domain& dom = rcu_default_domain()) noexcept {
-        rcu_synchronize(dom);
-    }
-}
-namespace v2 {
-    using v1::deleter_t;
+// A batch of pointers awaiting reclamation, plus the reader reference counts
+// that must reach zero before the batch can be freed.
+template <class RefCounts>
+class garbage_queue {
+  public:
+    static constexpr std::size_t capacity = 512;
+    using entry_t = std::pair<void*, std::move_only_function<void(void*)>>;
 
-    class rcu_domain;
-    rcu_domain& rcu_default_domain() noexcept;
+    garbage_queue() = default;
 
-    struct garbage_queue {
-        static constexpr std::size_t num_ref_counts = 16;
-        static constexpr std::size_t capacity = 512;
-        using ref_count_t = std::atomic<std::size_t>;
-        using padding = std::array<char, 64 - sizeof(ref_count_t)>;
-        using auto_ptr = std::pair<void*, deleter_t>;
+    [[nodiscard]] RefCounts& ref_counts() noexcept { return ref_counts_; }
 
-        std::array<std::pair<ref_count_t, padding>, num_ref_counts> ref_counts;
-        std::array<auto_ptr, capacity> queue;
-        std::size_t size;
-
-        auto ref_count() noexcept {
-            return ref_counts | std::ranges::views::keys;
-        }
-
-        garbage_queue() noexcept : ref_counts{}, queue{}, size{} {}
-        garbage_queue(const garbage_queue&) = delete;
-        garbage_queue(garbage_queue&&) = delete;
-        garbage_queue& operator=(const garbage_queue&) = delete;
-        garbage_queue& operator=(garbage_queue&&) = delete;
-        ~garbage_queue() noexcept {
-            assert(try_synchronize());
-            clear();
-        }
-        void synchronize() noexcept {
-            for (auto&& i : ref_count()) {
-                while (i.load(std::memory_order_relaxed) != 0)
-                    std::this_thread::yield();
-            }
-        }
-        bool try_synchronize() noexcept {
-            return std::ranges::all_of(ref_count(), [](auto&& count) {
-                return count.load(std::memory_order_acquire) == 0;
-            });
-        }
-        bool try_push(auto_ptr&& ptr) noexcept {
-            if (size < capacity) [[likely]] {
-                const auto index = size++;
-                queue[index] = std::move(ptr);
-                return true;
-            }
-            else {
-                return false;
-            }
-        }
-        void push_unchecked(auto_ptr&& ptr) noexcept {
-            const auto index = size++;
-            queue[index] = std::move(ptr);
-        }
-
-        void clear() {
-            for (auto&& [p, d] : queue | std::ranges::views::take(size)) {
-                d(p);
-                p = nullptr;
-            }
-            size = 0;
-        }
-    };
-
-    class rcu_domain {
-        inline thread_local static const std::size_t key = (std::hash<std::thread::id>{}(std::this_thread::get_id()) / 256) % garbage_queue::num_ref_counts;
-        inline thread_local static std::uint64_t num_readers = 0;
-        inline thread_local static std::atomic<std::size_t>* counter = nullptr;
-
-        std::atomic<std::size_t> generation;
-        std::array<garbage_queue, 2> garbage;
-        std::mutex mutex;
-
-        struct default_domain_tag_t {};
-        explicit rcu_domain(default_domain_tag_t) : generation{}, garbage{}, mutex{} {}
-
-    public:
-        rcu_domain() = delete;
-        rcu_domain(const rcu_domain&) = delete;
-        rcu_domain(rcu_domain&&) = delete;
-        rcu_domain& operator=(const rcu_domain&) = delete;
-        rcu_domain& operator=(rcu_domain&&) = delete;
-        ~rcu_domain() noexcept = default;
-
-        void lock() noexcept {
-            if (num_readers == 0)
-                counter = &garbage[generation.load(std::memory_order_acquire) % 2].ref_count()[key];
-            num_readers++;
-            counter->fetch_add(1, std::memory_order_release);
-        }
-        bool try_lock() noexcept {
-            lock();
-            return true;
-        }
-
-        void unlock() noexcept {
-            [[maybe_unused]] auto _ = static_cast<void*>(this); //prevents warning
-            num_readers--;
-            counter->fetch_sub(1, std::memory_order_release);
-        }
-        void retire(void* p, deleter_t&& d) noexcept {
-            std::lock_guard guard{mutex};
-            const auto current_gen = generation.load(std::memory_order_acquire);
-            const auto next_gen = (current_gen + 1) % 2;
-            auto ptr = garbage_queue::auto_ptr{p, std::move(d)};
-            if (!garbage[current_gen % 2].try_push(std::move(ptr))) [[unlikely]] {
-                garbage[next_gen].synchronize();
-                garbage[next_gen].clear();
-                garbage[next_gen].push_unchecked(std::move(ptr));
-                generation.store(current_gen + 1, std::memory_order_release);
-            }
-        }
-        void half_sync() noexcept {
-            const auto current_gen = generation.load(std::memory_order_acquire);
-            const auto target_gen = (current_gen + 1) % 2;
-            std::unique_lock guard{mutex};
-            if (generation.load(std::memory_order_acquire) < current_gen + 1) [[likely]] {
-                garbage[target_gen].synchronize();
-                garbage[target_gen].clear();
-                generation.store(current_gen + 1, std::memory_order_seq_cst);
-            }
-        }
-        friend void rcu_synchronize(rcu_domain& dom) noexcept;
-        friend rcu_domain& rcu_default_domain() noexcept;
-    };
-    template<class T, class D = std::default_delete<T>>
-    void rcu_retire(T* p, D d = D(), rcu_domain& dom = rcu_default_domain()) {
-        dom.retire(static_cast<void*>(p), deleter_t{std::type_identity<T>{}, std::move(d)});
-    }
-    inline rcu_domain& rcu_default_domain() noexcept {
-        static rcu_domain domain{rcu_domain::default_domain_tag_t{}};
-        return domain;
-    }
-
-    inline void rcu_synchronize(rcu_domain& dom = rcu_default_domain()) noexcept {
-        dom.half_sync();
-        dom.half_sync();
-    }
-
-    inline void rcu_barrier(rcu_domain& dom = rcu_default_domain()) noexcept {
-        rcu_synchronize(dom);
-    }
-}
-namespace single_ref_count {
-    using v1::deleter_t;
-
-    class rcu_domain;
-    rcu_domain& rcu_default_domain() noexcept;
-
-    struct garbage_queue {
-        static constexpr std::size_t num_ref_counts = 16;
-        static constexpr std::size_t capacity = 512;
-        using ref_count_t = std::atomic<std::size_t>;
-        using padding = std::array<char, 128 - sizeof(ref_count_t)>;
-        using auto_ptr = std::pair<void*, deleter_t>;
-
-        //std::array<std::pair<ref_count_t, padding>, num_ref_counts> ref_counts;
-        std::atomic<std::uint64_t> ref_count;
-        std::array<auto_ptr, capacity> queue;
-        std::size_t size;
-
-        garbage_queue() noexcept : ref_count{}, queue{}, size{} {}
-        garbage_queue(const garbage_queue&) = delete;
-        garbage_queue(garbage_queue&&) = delete;
-        garbage_queue& operator=(const garbage_queue&) = delete;
-        garbage_queue& operator=(garbage_queue&&) = delete;
-        ~garbage_queue() noexcept {
-            assert(try_synchronize());
-            clear();
-        }
-        void synchronize() noexcept {
-            while (ref_count.load(std::memory_order_relaxed) != 0)
+    // Wait until every reader that may reference this generation is done.
+    // The acquire load pairs with readers' release store in unlock(), so
+    // observing zero synchronizes with the end of every read-side critical
+    // section that started before this point. Using relaxed loads here would
+    // break that happens-before and let a writer reclaim memory a reader is
+    // still accessing.
+    void synchronize() noexcept {
+        for (auto& counter : ref_counts_.refs()) {
+            while (counter.load(std::memory_order_acquire) != 0) {
                 std::this_thread::yield();
-        }
-        bool try_synchronize() noexcept {
-            return ref_count.load(std::memory_order_acquire) == 0;
-        }
-        bool try_push(auto_ptr&& ptr) noexcept {
-            if (size < capacity) [[likely]] {
-                const auto index = size++;
-                queue[index] = std::move(ptr);
-                return true;
-            }
-            else {
-                return false;
             }
         }
-        void push_unchecked(auto_ptr&& ptr) noexcept {
-            const auto index = size++;
-            queue[index] = std::move(ptr);
-        }
+    }
 
-        void clear() {
-            assert(try_synchronize());
-            for (auto&& [p, d] : queue | std::ranges::views::take(size)) {
-                d(p);
-                p = nullptr;
-            }
-            size = 0;
-        }
-    };
+    [[nodiscard]] bool try_synchronize() noexcept {
+        return std::ranges::all_of(ref_counts_.refs(), [](auto& counter) {
+            return counter.load(std::memory_order_acquire) == 0;
+        });
+    }
 
-    class rcu_domain {
-        inline thread_local static const std::size_t key = std::hash<std::thread::id>{}(std::this_thread::get_id()) % garbage_queue::num_ref_counts;
-        inline thread_local static std::uint64_t num_readers = 0;
-        inline thread_local static std::atomic<std::size_t>* counter = nullptr;
-
-        std::atomic<std::size_t> generation;
-        std::array<garbage_queue, 2> garbage;
-        std::mutex mutex;
-
-        struct default_domain_tag_t {};
-        explicit rcu_domain(default_domain_tag_t) : generation{}, garbage{}, mutex{} {}
-
-    public:
-        rcu_domain() = delete;
-        rcu_domain(const rcu_domain&) = delete;
-        rcu_domain(rcu_domain&&) = delete;
-        rcu_domain& operator=(const rcu_domain&) = delete;
-        rcu_domain& operator=(rcu_domain&&) = delete;
-        ~rcu_domain() noexcept = default;
-
-        void lock() noexcept {
-            if (num_readers == 0)
-                counter = &garbage[generation.load(std::memory_order_acquire) % 2].ref_count;
-            num_readers++;
-            counter->fetch_add(1, std::memory_order_release);
-        }
-        bool try_lock() noexcept {
-            lock();
+    [[nodiscard]] bool try_push(entry_t&& entry) noexcept {
+        if (size_ < capacity) [[likely]] {
+            queue_[size_++] = std::move(entry);
             return true;
         }
+        return false;
+    }
 
-        void unlock() noexcept {
-            [[maybe_unused]] auto _ = static_cast<void*>(this); //prevents warning
-            num_readers--;
-            counter->fetch_sub(1, std::memory_order_release);
+    void push_unchecked(entry_t&& entry) noexcept {
+        queue_[size_++] = std::move(entry);
+    }
+
+    // Reclaim every retired pointer in the queue. Callers must guarantee no
+    // reader can still reference them (e.g. after synchronize()).
+    void clear() noexcept {
+        for (auto& [ptr, deleter] : std::span{queue_.data(), size_}) {
+            deleter(ptr);
         }
-        void retire(void* p, deleter_t&& d) noexcept {
-            std::lock_guard guard{mutex};
-            const auto current_gen = generation.load(std::memory_order_acquire);
+        size_ = 0;
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
+  private:
+    RefCounts ref_counts_{};
+    std::array<entry_t, capacity> queue_{};
+    std::size_t size_ = 0;
+};
+
+} // namespace detail
+
+// ---------------------------------------------------------------------------
+// Read-copy-update domain.
+//
+// Two generations of garbage are kept. Readers announce themselves in the
+// generation that is current when they lock(); a writer reclaims a generation
+// only after all its readers have unlocked(). retire() hands ownership of a
+// pointer to the domain; the pointer is freed once a grace period has elapsed.
+// ---------------------------------------------------------------------------
+template <class RefCounts>
+class rcu_domain {
+  public:
+    rcu_domain() = default;
+    ~rcu_domain() = default;
+
+    rcu_domain(const rcu_domain&) = delete;
+    rcu_domain& operator=(const rcu_domain&) = delete;
+    rcu_domain(rcu_domain&&) = delete;
+    rcu_domain& operator=(rcu_domain&&) = delete;
+
+    // Mark the beginning of a read-side critical section. Nested calls are
+    // counted; the underlying ref-count is incremented once per outermost
+    // lock()/unlock() pair.
+    void lock() noexcept {
+        if (reader_depth() == 0) {
+            current_counter() = &generation_ref_count();
+        }
+        ++reader_depth();
+        current_counter()->fetch_add(1, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool try_lock() noexcept {
+        lock();
+        return true;
+    }
+
+    // Mark the end of a read-side critical section.
+    void unlock() noexcept {
+        if (reader_depth() == 0) {
+            // Defensive: an unlock() without a matching lock() is a no-op
+            // rather than an underflow.
+            return;
+        }
+        --reader_depth();
+        current_counter()->fetch_sub(1, std::memory_order_release);
+    }
+
+    // Hand `ptr` to the domain for reclamation. `deleter` is invoked with
+    // `ptr` once a grace period has elapsed. Ownership transfers to the
+    // domain; do not use `ptr` after calling retire().
+    void retire(void* ptr, std::move_only_function<void(void*)> deleter) {
+        std::lock_guard guard{mutex_};
+        const auto current_gen = generation_.load(std::memory_order_acquire);
+        auto entry = std::pair<void*, std::move_only_function<void(void*)>>{
+            ptr, std::move(deleter)};
+        if (!garbage_[current_gen % 2].try_push(std::move(entry))) [[unlikely]] {
             const auto next_gen = (current_gen + 1) % 2;
-            auto ptr = garbage_queue::auto_ptr{p, std::move(d)};
-            if (!garbage[current_gen % 2].try_push(std::move(ptr))) [[unlikely]] {
-                garbage[next_gen].synchronize();
-                garbage[next_gen].clear();
-                garbage[next_gen].push_unchecked(std::move(ptr));
-                generation.store(current_gen + 1, std::memory_order_release);
-            }
+            garbage_[next_gen].synchronize();
+            garbage_[next_gen].clear();
+            garbage_[next_gen].push_unchecked(std::move(entry));
+            generation_.store(current_gen + 1, std::memory_order_release);
         }
-        void half_sync() noexcept {
-            const auto current_gen = generation.load(std::memory_order_acquire);
-            const auto target_gen = (current_gen + 1) % 2;
-            std::unique_lock guard{mutex};
-            if (generation.load(std::memory_order_acquire) < current_gen + 1) [[likely]] {
-                garbage[target_gen].synchronize();
-                garbage[target_gen].clear();
-                generation.store(current_gen + 1, std::memory_order_seq_cst);
-            }
-        }
-        friend void rcu_synchronize(rcu_domain& dom) noexcept;
-        friend rcu_domain& rcu_default_domain() noexcept;
-    };
-    template<class T, class D = std::default_delete<T>>
-    void rcu_retire(T* p, D d = D(), rcu_domain& dom = rcu_default_domain()) {
-        dom.retire(static_cast<void*>(p), deleter_t{std::type_identity<T>{}, std::move(d)});
-    }
-    inline rcu_domain& rcu_default_domain() noexcept {
-        static rcu_domain domain{rcu_domain::default_domain_tag_t{}};
-        return domain;
     }
 
-    inline void rcu_synchronize(rcu_domain& dom = rcu_default_domain()) noexcept {
-        dom.half_sync();
-        dom.half_sync();
+    // Reclaim one generation's worth of garbage: wait for its readers to
+    // drain, free its retired pointers, then advance the generation. Calling
+    // half_sync() twice constitutes a full grace period.
+    void half_sync() noexcept {
+        const auto current_gen = generation_.load(std::memory_order_acquire);
+        const auto target_gen = (current_gen + 1) % 2;
+        std::unique_lock guard{mutex_};
+        if (generation_.load(std::memory_order_acquire) < current_gen + 1) [[likely]] {
+            garbage_[target_gen].synchronize();
+            garbage_[target_gen].clear();
+            generation_.store(current_gen + 1, std::memory_order_release);
+        }
     }
 
-    inline void rcu_barrier(rcu_domain& dom = rcu_default_domain()) noexcept {
-        rcu_synchronize(dom);
+  private:
+    static std::size_t& key() noexcept {
+        thread_local const std::size_t value =
+            std::hash<std::thread::id>{}(std::this_thread::get_id()) %
+            RefCounts::count();
+        return const_cast<std::size_t&>(value);
     }
+
+    static std::uint64_t& reader_depth() noexcept {
+        thread_local std::uint64_t value = 0;
+        return value;
+    }
+
+    static std::atomic<std::size_t>*& current_counter() noexcept {
+        thread_local std::atomic<std::size_t>* value = nullptr;
+        return value;
+    }
+
+    std::atomic<std::size_t>& generation_ref_count() noexcept {
+        return garbage_[generation_.load(std::memory_order_acquire) % 2]
+            .ref_counts()
+            .at(key());
+    }
+
+    using garbage_queue_t = detail::garbage_queue<RefCounts>;
+
+    std::atomic<std::size_t> generation_{0};
+    std::array<garbage_queue_t, 2> garbage_{};
+    std::mutex mutex_;
+};
+
+// ---------------------------------------------------------------------------
+// v2: 16 sharded reader ref-counts, each padded to its own cache line.
+// ---------------------------------------------------------------------------
+namespace v2 {
+using ref_counts = detail::padded_sharded_ref_counts<16, 64 - sizeof(std::atomic<std::size_t>)>;
+using rcu_domain = rcu_domain<ref_counts>;
+
+inline rcu_domain& rcu_default_domain() noexcept {
+    static rcu_domain domain;
+    return domain;
 }
+
+template <class T, class D = std::default_delete<T>>
+void rcu_retire(T* ptr, D deleter = D(), rcu_domain& dom = rcu_default_domain()) {
+    dom.retire(ptr, [deleter = std::move(deleter)](void* p) mutable {
+        std::move(deleter)(static_cast<T*>(p));
+    });
+}
+
+inline void rcu_synchronize(rcu_domain& dom = rcu_default_domain()) noexcept {
+    dom.half_sync();
+    dom.half_sync();
+}
+
+inline void rcu_barrier(rcu_domain& dom = rcu_default_domain()) noexcept {
+    rcu_synchronize(dom);
+}
+} // namespace v2
+
+// ---------------------------------------------------------------------------
+// single_ref_count: a single global reader ref-count (no sharding, maximum
+// contention, included for comparison).
+// ---------------------------------------------------------------------------
+namespace single_ref_count {
+using ref_counts = detail::padded_sharded_ref_counts<1, 128>;
+using rcu_domain = rcu_domain<ref_counts>;
+
+inline rcu_domain& rcu_default_domain() noexcept {
+    static rcu_domain domain;
+    return domain;
+}
+
+template <class T, class D = std::default_delete<T>>
+void rcu_retire(T* ptr, D deleter = D(), rcu_domain& dom = rcu_default_domain()) {
+    dom.retire(ptr, [deleter = std::move(deleter)](void* p) mutable {
+        std::move(deleter)(static_cast<T*>(p));
+    });
+}
+
+inline void rcu_synchronize(rcu_domain& dom = rcu_default_domain()) noexcept {
+    dom.half_sync();
+    dom.half_sync();
+}
+
+inline void rcu_barrier(rcu_domain& dom = rcu_default_domain()) noexcept {
+    rcu_synchronize(dom);
+}
+} // namespace single_ref_count
+
+// ---------------------------------------------------------------------------
+// false_sharing: 16 sharded reader ref-counts packed with no padding, so
+// distinct slots share cache lines (deliberately exhibits false sharing).
+// ---------------------------------------------------------------------------
 namespace false_sharing {
-    using v1::deleter_t;
+using ref_counts = detail::padded_sharded_ref_counts<16, 0>;
+using rcu_domain = rcu_domain<ref_counts>;
 
-    class rcu_domain;
-    rcu_domain& rcu_default_domain() noexcept;
-
-    struct garbage_queue {
-        static constexpr std::size_t num_ref_counts = 16;
-        static constexpr std::size_t capacity = 512;
-        using ref_count_t = std::atomic<std::size_t>;
-        using auto_ptr = std::pair<void*, deleter_t>;
-
-        std::array<ref_count_t, num_ref_counts> ref_counts;
-        std::array<auto_ptr, capacity> queue;
-        std::size_t size;
-
-        auto& ref_count() noexcept {
-            return ref_counts;
-        }
-
-        garbage_queue() noexcept : ref_counts{}, queue{}, size{} {}
-        garbage_queue(const garbage_queue&) = delete;
-        garbage_queue(garbage_queue&&) = delete;
-        garbage_queue& operator=(const garbage_queue&) = delete;
-        garbage_queue& operator=(garbage_queue&&) = delete;
-        ~garbage_queue() noexcept {
-            assert(try_synchronize());
-            clear();
-        }
-        void synchronize() noexcept {
-            for (auto&& i : ref_count()) {
-                while (i.load(std::memory_order_relaxed) != 0)
-                    std::this_thread::yield();
-            }
-        }
-        bool try_synchronize() noexcept {
-            return std::ranges::all_of(ref_count(), [](auto&& count) {
-                return count.load(std::memory_order_acquire) == 0;
-            });
-        }
-        bool try_push(auto_ptr&& ptr) noexcept {
-            if (size < capacity) [[likely]] {
-                const auto index = size++;
-                queue[index] = std::move(ptr);
-                return true;
-            }
-            else {
-                return false;
-            }
-        }
-        void push_unchecked(auto_ptr&& ptr) noexcept {
-            const auto index = size++;
-            queue[index] = std::move(ptr);
-        }
-
-        void clear() {
-            assert(try_synchronize());
-            for (auto&& [p, d] : queue | std::ranges::views::take(size)) {
-                d(p);
-                p = nullptr;
-            }
-            size = 0;
-        }
-    };
-
-    class rcu_domain {
-        inline thread_local static const std::size_t key = (std::hash<std::thread::id>{}(std::this_thread::get_id()) / 256) % garbage_queue::num_ref_counts;
-        inline thread_local static std::uint64_t num_readers = 0;
-        inline thread_local static std::atomic<std::size_t>* counter = nullptr;
-
-        std::atomic<std::size_t> generation;
-        std::array<garbage_queue, 2> garbage;
-        std::mutex mutex;
-
-        struct default_domain_tag_t {};
-        explicit rcu_domain(default_domain_tag_t) : generation{}, garbage{}, mutex{} {}
-
-    public:
-        rcu_domain() = delete;
-        rcu_domain(const rcu_domain&) = delete;
-        rcu_domain(rcu_domain&&) = delete;
-        rcu_domain& operator=(const rcu_domain&) = delete;
-        rcu_domain& operator=(rcu_domain&&) = delete;
-        ~rcu_domain() noexcept = default;
-
-        void lock() noexcept {
-            if (num_readers == 0)
-                counter = &garbage[generation.load(std::memory_order_acquire) % 2].ref_count()[key];
-            num_readers++;
-            counter->fetch_add(1, std::memory_order_release);
-        }
-        bool try_lock() noexcept {
-            lock();
-            return true;
-        }
-
-        void unlock() noexcept {
-            [[maybe_unused]] auto _ = static_cast<void*>(this); //prevents warning
-            num_readers--;
-            counter->fetch_sub(1, std::memory_order_release);
-        }
-        void retire(void* p, deleter_t&& d) noexcept {
-            std::lock_guard guard{mutex};
-            const auto current_gen = generation.load(std::memory_order_acquire);
-            const auto next_gen = (current_gen + 1) % 2;
-            auto ptr = garbage_queue::auto_ptr{p, std::move(d)};
-            if (!garbage[current_gen % 2].try_push(std::move(ptr))) [[unlikely]] {
-                garbage[next_gen].synchronize();
-                garbage[next_gen].clear();
-                garbage[next_gen].push_unchecked(std::move(ptr));
-                generation.store(current_gen + 1, std::memory_order_release);
-            }
-        }
-        void half_sync() noexcept {
-            const auto current_gen = generation.load(std::memory_order_acquire);
-            const auto target_gen = (current_gen + 1) % 2;
-            std::unique_lock guard{mutex};
-            if (generation.load(std::memory_order_acquire) < current_gen + 1) [[likely]] {
-                garbage[target_gen].synchronize();
-                garbage[target_gen].clear();
-                generation.store(current_gen + 1, std::memory_order_seq_cst);
-            }
-        }
-        friend void rcu_synchronize(rcu_domain& dom) noexcept;
-        friend rcu_domain& rcu_default_domain() noexcept;
-    };
-    template<class T, class D = std::default_delete<T>>
-    void rcu_retire(T* p, D d = D(), rcu_domain& dom = rcu_default_domain()) {
-        dom.retire(static_cast<void*>(p), deleter_t{std::type_identity<T>{}, std::move(d)});
-    }
-    inline rcu_domain& rcu_default_domain() noexcept {
-        static rcu_domain domain{rcu_domain::default_domain_tag_t{}};
-        return domain;
-    }
-
-    inline void rcu_synchronize(rcu_domain& dom = rcu_default_domain()) noexcept {
-        dom.half_sync();
-        dom.half_sync();
-    }
-
-    inline void rcu_barrier(rcu_domain& dom = rcu_default_domain()) noexcept {
-        rcu_synchronize(dom);
-    }
-}
+inline rcu_domain& rcu_default_domain() noexcept {
+    static rcu_domain domain;
+    return domain;
 }
 
-#endif //RCU_RCU_H
+template <class T, class D = std::default_delete<T>>
+void rcu_retire(T* ptr, D deleter = D(), rcu_domain& dom = rcu_default_domain()) {
+    dom.retire(ptr, [deleter = std::move(deleter)](void* p) mutable {
+        std::move(deleter)(static_cast<T*>(p));
+    });
+}
+
+inline void rcu_synchronize(rcu_domain& dom = rcu_default_domain()) noexcept {
+    dom.half_sync();
+    dom.half_sync();
+}
+
+inline void rcu_barrier(rcu_domain& dom = rcu_default_domain()) noexcept {
+    rcu_synchronize(dom);
+}
+} // namespace false_sharing
+
+} // namespace rcu
+
+#endif // RCU_RCU_H

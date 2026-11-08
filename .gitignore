@@ -1,0 +1,44 @@
+# Generated binaries and build directories
+cmake-build-*/
+build/
+out/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Project executables
+rcu
+rcu_tests
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+
+# IDE (JetBrains CLion / IntelliJ)
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
